@@ -113,6 +113,7 @@ choice **criteria**: option   # AI-selected branch
 block name(params):           # Reusable block
 do blockname(args)            # Invoke block
 items | map: ...              # Pipeline
+sleep 5s                      # Pause execution
 ```
 
 For complete syntax and validation rules, see `compiler.md`.

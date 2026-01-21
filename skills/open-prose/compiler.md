@@ -75,7 +75,8 @@ If a construct is ambiguous or non-obvious, it should be flagged or transformed 
 18. [Error Handling](#error-handling)
 19. [Choice Blocks](#choice-blocks)
 20. [Conditional Statements](#conditional-statements)
-21. [Execution Model](#execution-model)
+21. [Sleep Statement](#sleep-statement)
+22. [Execution Model](#execution-model)
 22. [Validation Rules](#validation-rules)
 23. [Examples](#examples)
 24. [Future Features](#future-features)
@@ -2591,6 +2592,81 @@ discretion ::= "**" text "**" | "***" text "***"
 
 ---
 
+## Sleep Statement
+
+The `sleep` statement pauses execution for a specified duration. This enables rate limiting, polling intervals, and timing-based workflows.
+
+### Syntax
+
+```prose
+sleep <duration>
+```
+
+Where duration is a number followed by a time unit.
+
+### Duration Format
+
+```
+<number><unit>
+```
+
+### Supported Time Units
+
+| Unit | Meaning      | Example  |
+|------|--------------|----------|
+| `ms` | Milliseconds | `500ms`  |
+| `s`  | Seconds      | `5s`     |
+| `m`  | Minutes      | `2m`     |
+| `h`  | Hours        | `1h`     |
+
+### Examples
+
+```prose
+sleep 5s      # Wait 5 seconds
+sleep 100ms   # Wait 100 milliseconds
+sleep 2m      # Wait 2 minutes
+sleep 1h      # Wait 1 hour
+
+# Rate-limited API calls
+repeat 3:
+  session "Call API"
+  sleep 1s  # Respect rate limit
+
+# Polling loop
+loop until **task complete** (max: 10):
+  session "Check status"
+  sleep 5s  # Wait between checks
+```
+
+### Execution Semantics
+
+When the OpenProse VM encounters a `sleep` statement:
+
+1. Parse the duration value and unit
+2. Convert to milliseconds
+3. Pause execution for the specified duration
+4. Continue to the next statement
+
+Since the OpenProse VM runs on an AI session, "sleeping" means the orchestrating system should delay before continuing. In practice, this translates to a timer/delay in the host environment.
+
+### Validation Rules
+
+| Check | Severity | Code | Message |
+|-------|----------|------|---------|
+| Invalid time unit | Error | E029 | `Invalid time unit '{unit}'. Use ms, s, m, or h` |
+| Negative duration | Error | E030 | `Sleep duration must be positive` |
+| Zero duration | Warning | W012 | `Sleep duration is 0, statement has no effect` |
+| Very long duration (>1h) | Warning | W013 | `Sleep duration exceeds 1 hour, consider breaking into smaller waits` |
+
+### Edge Cases
+
+1. **Zero duration (`sleep 0s`)** - Valid but emits a warning; effectively a no-op
+2. **Very large values (`sleep 999h`)** - Valid but warns; no hard maximum
+3. **Sleep in parallel blocks** - Each branch sleeps independently; doesn't block siblings
+4. **Sleep in loops** - Executes each iteration; total delay = iterations × sleep duration
+
+---
+
 ## Execution Model
 
 OpenProse uses a two-phase execution model.
@@ -2673,6 +2749,8 @@ The validator checks programs for errors and warnings before execution.
 | E026 | Missing required input              |
 | E027 | Unknown input name in invocation    |
 | E028 | Unknown output property access      |
+| E029 | Invalid time unit in sleep          |
+| E030 | Negative sleep duration             |
 
 ### Warnings (Non-blocking)
 
@@ -2689,6 +2767,8 @@ The validator checks programs for errors and warnings before execution.
 | W009 | Unknown permission value                 |
 | W010 | Empty skills array                       |
 | W011 | `session:` on persistent agent with existing memory |
+| W012 | Zero sleep duration (no effect)                     |
+| W013 | Sleep duration exceeds 1 hour                       |
 
 ### Error Message Format
 
@@ -2855,7 +2935,11 @@ statement   → useStatement | inputDecl | agentDef | session | resumeStmt
             | letBinding | constBinding | assignment | outputBinding
             | parallelBlock | repeatBlock | forEachBlock | loopBlock
             | tryBlock | choiceBlock | ifStatement | doBlock | blockDef
-            | throwStatement | comment
+            | throwStatement | sleepStatement | comment
+
+sleepStatement → "sleep" duration
+duration       → NUMBER timeUnit
+timeUnit       → "ms" | "s" | "m" | "h"
 
 # Program Composition
 useStatement → "use" string ( "as" IDENTIFIER )?

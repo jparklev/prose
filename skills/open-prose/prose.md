@@ -329,7 +329,12 @@ statement := useStatement | inputDecl | agentDef | session | resumeStmt
 | letBinding | constBinding | assignment | outputBinding
 | parallelBlock | repeatBlock | forEachBlock | loopBlock
 | tryBlock | choiceBlock | ifStatement | doBlock | blockDef
-| throwStatement | comment
+| throwStatement | sleepStatement | comment
+
+# Sleep Statement
+sleepStatement := "sleep" duration
+duration := NUMBER timeUnit
+timeUnit := "ms" | "s" | "m" | "h"
 
 # Program Composition
 
@@ -896,6 +901,62 @@ loop until **task complete** (max: 10):
 1. Check condition before each iteration
 2. Exit if condition satisfied OR max reached
 3. Execute body if continuing
+
+---
+
+## Sleep Execution
+
+The `sleep` statement pauses execution for a specified duration:
+
+```prose
+sleep 5s      # Wait 5 seconds
+sleep 100ms   # Wait 100 milliseconds
+sleep 2m      # Wait 2 minutes
+```
+
+### Supported Time Units
+
+| Unit | Meaning      |
+|------|--------------|
+| `ms` | Milliseconds |
+| `s`  | Seconds      |
+| `m`  | Minutes      |
+| `h`  | Hours        |
+
+### Execution Semantics
+
+When the VM encounters a `sleep` statement:
+
+1. **Parse**: Extract the numeric value and time unit
+2. **Convert**: Convert to milliseconds (e.g., `5s` → 5000ms)
+3. **Delay**: Pause execution for the specified duration
+4. **Continue**: Proceed to the next statement
+
+### Implementation Notes
+
+Since the OpenProse VM runs within an AI session, "sleeping" translates to a delay in the host environment. The VM signals the delay to the orchestrating system, which implements it using:
+
+- Shell `sleep` commands (e.g., `sleep 5` for bash)
+- Timer APIs in the host runtime
+- Scheduled continuation of the conversation
+
+### Sleep in Control Flow
+
+```prose
+# Sleep in a loop (total delay = iterations × sleep)
+repeat 3:
+  session "Process batch"
+  sleep 2s  # 2s between batches
+
+# Sleep in parallel (each branch sleeps independently)
+parallel:
+  do:
+    sleep 5s
+    session "Task A"
+  do:
+    sleep 2s
+    session "Task B"  # Starts before Task A
+```
 
 ---
 

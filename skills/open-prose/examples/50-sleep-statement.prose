@@ -1,0 +1,22 @@
+# Demonstrates the sleep statement for rate limiting and timing
+
+# Start a long-running process
+session "Begin the data processing task"
+
+sleep 2s  # Wait for external process to initialize
+
+session "Verify the process started correctly"
+
+# Rate-limited API calls with delays between requests
+repeat 3:
+  session "Make API request to fetch data"
+  sleep 1s  # Respect rate limit between API calls
+
+session "Process all fetched data"
+
+# Polling loop with sleep between checks
+loop until **the export is complete** (max: 5):
+  session "Check export status"
+  sleep 3s  # Wait before checking again
+
+session "Download the completed export"
