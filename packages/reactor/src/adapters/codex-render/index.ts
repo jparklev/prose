@@ -114,12 +114,72 @@ export function createCodexRenderBackend(config: CodexRenderBackendConfig = {}):
       if (req.context.workingDir !== undefined) threadOpts["workingDirectory"] = req.context.workingDir;
       if (config.modelReasoningEffort !== undefined) threadOpts["modelReasoningEffort"] = config.modelReasoningEffort;
 
+      // #13 FIX: materialize the subscribed UPSTREAM truths as files in the
+      // working dir. The harness hands inputs as pointers for the wm_* tools — a
+      // filesystem Codex render has no such tools, so without this it only sees
+      // its OWN prior truth and can never adopt a new upstream arrival. We read
+      // each subscribed producer's current truth from the store and write it
+      // under `inputs/<producer>/`, then point the render at it.
+      let inputNote = "";
+      const wd = req.context.workingDir;
+      const upstream = req.context.upstream ?? [];
+      if (wd && upstream.length > 0) {
+        try {
+          const fs = (await import("node:fs")) as typeof import("node:fs");
+          const nodePath = (await import("node:path")) as typeof import("node:path");
+          // Clear any inputs staged by a prior render of this node (the working
+          // dir persists), so the render only sees the CURRENT upstream truth.
+          fs.rmSync(nodePath.join(wd, "inputs"), { recursive: true, force: true });
+          const staged: string[] = [];
+          const seen = new Set<string>();
+          for (const sub of upstream) {
+            if (seen.has(sub.producer)) continue;
+            seen.add(sub.producer);
+            const read = req.context.store.read(sub.producer);
+            const safe = sub.producer.replace(/[^A-Za-z0-9._-]/g, "_");
+            const dir = nodePath.join(wd, "inputs", safe);
+            fs.mkdirSync(dir, { recursive: true });
+            for (const [p, bytes] of Object.entries(read.files ?? {})) {
+              const fname = p.replace(/[\\/]/g, "_");
+              fs.writeFileSync(nodePath.join(dir, fname), Buffer.from(bytes as Uint8Array));
+              staged.push(`inputs/${safe}/${fname}`);
+            }
+          }
+          if (staged.length > 0) {
+            inputNote = `\n\nYour CURRENT subscribed inputs are staged as files in your working directory: ${staged.join(", ")}. Read them — they are the authoritative source for this render; your maintained truth must reflect their current contents, not any prior value.`;
+          }
+        } catch { /* best-effort; fall back to the pointer input */ }
+      }
+
       // The harness composes instructions (SKILL + contract) + a short pointer
-      // input; concatenate and request the structured done/failed signal.
-      const prompt = `${req.instructions}\n\n${req.input}${SIGNAL_INSTRUCTION}`;
+      // input; concatenate, point at the staged inputs, and request the signal.
+      const prompt = `${req.instructions}\n\n${req.input}${inputNote}${SIGNAL_INSTRUCTION}`;
       const runOpts: { outputSchema?: unknown; signal?: AbortSignal } = {};
       if (config.outputSchema !== undefined) runOpts.outputSchema = config.outputSchema;
       if (req.signal !== undefined) runOpts.signal = req.signal;
+
+      // Debug (REACTOR_CODEX_DEBUG=<path>): capture what THIS render can actually
+      // read — its pointer input + the files staged into its working dir — so we
+      // can tell whether a gateway sees the new ingress arrival vs only its prior.
+      if (process.env["REACTOR_CODEX_DEBUG"]) {
+        try {
+          const fs = (await import("node:fs")) as typeof import("node:fs");
+          const wd = req.context.workingDir;
+          const files: Array<{ path: string; snippet: string }> = [];
+          if (wd) {
+            const walk = (dir: string, base = ""): void => {
+              for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const rel = base ? `${base}/${e.name}` : e.name;
+                const full = `${dir}/${e.name}`;
+                if (e.isDirectory()) walk(full, rel);
+                else { let snippet = ""; try { const b = fs.readFileSync(full); snippet = b.length < 600 ? b.toString("utf8") : `(${b.length} bytes)`; } catch { /* skip */ } files.push({ path: rel, snippet }); }
+              }
+            };
+            try { walk(wd); } catch { /* dir missing */ }
+          }
+          fs.appendFileSync(process.env["REACTOR_CODEX_DEBUG"], JSON.stringify({ phase: "render", node: req.node, input: req.input, workingDir: wd, files }) + "\n");
+        } catch { /* ignore debug errors */ }
+      }
 
       let turn: CodexTurnLike;
       try {

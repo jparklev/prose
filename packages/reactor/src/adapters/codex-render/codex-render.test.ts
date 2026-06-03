@@ -82,7 +82,9 @@ test("codex compile backend: parses a JSON artifact + maps usage; read-only sand
   let opts: Record<string, unknown> | undefined;
   const codex = codexReturning({ finalResponse: '{"matches":[{"a":1}]}', usage: { input_tokens: 50, output_tokens: 10 } }, (o) => { opts = o as Record<string, unknown>; });
   const out = await createCodexCompileBackend({ codex }).runSession(compileReq());
-  assert.deepEqual(out.output, { matches: [{ a: 1 }] });
+  // guardArtifact coerces a forme artifact's missing arrays (nodes) to [] so the
+  // deterministic lowering can't crash on a partial LLM output.
+  assert.deepEqual(out.output, { matches: [{ a: 1 }], nodes: [] });
   assert.equal(out.usage.inputTokens, 50);
   assert.equal(out.usage.outputTokens, 10);
   assert.equal(opts?.["sandboxMode"], "read-only");
