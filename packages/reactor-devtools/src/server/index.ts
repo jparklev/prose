@@ -1,41 +1,36 @@
 // The SERVER — a tiny Node `http` server (zero runtime dep beyond the SDK).
 //
-// Stack decision (plan §5.1, honored): Node built-in `http` + static SPA from
-// `src/public`. Replay is a plain JSON read of the {@link ReplaySnapshot}; the
-// SPA owns all pacing (the scrubber, play/pause/speed) client-side, so replay
-// needs no streaming. The `/events` SSE endpoint is scaffolded here as the seam
-// S3 (live attach — OUT OF SCOPE this workflow) will push receipts through; in
-// replay it stays idle.
+// The viewer is a READ-ONLY projection of the receipt ledger. Replay (static
+// state-dir) and live (`reactor serve` writing the same dir) are the same
+// projection: `/events` emits append-only frame deltas. The ledger is a single
+// JSON array written atomically (temp + rename), so a reader never sees a torn
+// file — on any change we re-read the whole file, rebuild the snapshot, and diff
+// against the last one. Contiguous extension → `receipt.appended` deltas;
+// otherwise (truncation, prefix or metadata change) → `state.reset`. Strictly
+// observer-side: we only READ committed receipts; nothing here gates a render.
 //
-// Routes:
-//   GET /                  → the SPA shell (index.html)
-//   GET /app.js , /app.css → SPA assets (served from src/public, dist/public)
-//   GET /api/state         → the full ReplaySnapshot JSON (S1/S2 feed: topology
-//                            + frames + costRollup). `/api/snapshot` is a kept alias.
-//   GET /api/node/:id?version=<v>
-//                          → the node's world-model at a version (S4 click-through),
-//                            via FileSystemWorldModelStore.readVersion. `version`
-//                            is a frame's `atomicVersion` (= fingerprints["@atomic"]).
-//   GET /events            → SSE stream (S3 seam; no-op in replay)
+// Hardening (Codex review): clients carry their baseline frame HASH so a reset
+// between /api/state and /events can't graft new history onto an old snapshot;
+// the diff also resets on metadata (nodes/edges/labels) change, not just frames;
+// SSE writes are back-pressure / disconnect aware. Per-node chain-verify is
+// surfaced in the snapshot so the viewer can flag a tampered ledger.
 
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, watch, type FSWatcher } from "node:fs";
 import { join, normalize } from "node:path";
 
 import {
   openStateDir,
   buildSnapshot,
   readNodeWorldModel,
+  verifyNodeChainRaw,
   type OpenedStateDir,
   type ReplaySnapshot,
 } from "../data";
 
 export interface DevToolsServerOptions {
-  /** The saved state directory to replay. */
   readonly stateDir: string;
-  /** Port to listen on. Default 4555. */
   readonly port?: number;
-  /** Host to bind. Default "127.0.0.1". */
   readonly host?: string;
 }
 
@@ -49,7 +44,6 @@ export interface DevToolsServer {
 const DEFAULT_PORT = 4555;
 const DEFAULT_HOST = "127.0.0.1";
 
-// SPA assets are copied to dist/public at build; in dev they live in src/public.
 function publicDir(): string {
   const built = join(__dirname, "..", "public");
   if (existsSync(join(built, "index.html"))) return built;
@@ -62,6 +56,7 @@ const CONTENT_TYPES: Record<string, string> = {
   ".css": "text/css; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml",
+  ".map": "application/json; charset=utf-8",
 };
 
 function contentTypeFor(path: string): string {
@@ -70,65 +65,168 @@ function contentTypeFor(path: string): string {
   return CONTENT_TYPES[ext] ?? "application/octet-stream";
 }
 
-/**
- * Start the DevTools replay server over a saved state dir. Builds the snapshot
- * once (replay is immutable) and serves it to the SPA.
- */
-export async function startDevToolsServer(
-  options: DevToolsServerOptions,
-): Promise<DevToolsServer> {
+type Frame = ReplaySnapshot["frames"][number];
+// The snapshot we serve, augmented with per-node chain-verify (committed-fact
+// tamper evidence the viewer turns into a `chain-verify-break` surprise).
+type LiveSnapshot = ReplaySnapshot & { chainVerify: Record<string, boolean> };
+type DevtoolsEvent =
+  | { type: "receipt.appended"; frame: Frame; chainVerify: Record<string, boolean> }
+  | { type: "state.reset"; snapshot: LiveSnapshot }
+  | { type: "hello"; frames: number };
+
+/** Stable key over the NON-frame projection, so a metadata change forces reset. */
+function metaKey(s: ReplaySnapshot): string {
+  return JSON.stringify({ nodes: s.nodes, edges: s.edges, entryPoints: s.entryPoints, labels: s.labels, hasTopology: s.hasTopology, acyclic: s.acyclic });
+}
+
+function computeChainVerify(opened: OpenedStateDir, frames: readonly Frame[]): Record<string, boolean> {
+  const out: Record<string, boolean> = {};
+  const nodes = new Set(frames.map((f) => f.node));
+  for (const node of nodes) {
+    try { out[node] = verifyNodeChainRaw(opened, node).ok; } catch { out[node] = true; }
+  }
+  return out;
+}
+
+class LiveProjector {
+  readonly stateDir: string;
+  opened: OpenedStateDir;
+  snapshot: LiveSnapshot;
+  private meta: string;
+  private readonly clients = new Set<ServerResponse>();
+  private watcher: FSWatcher | null = null;
+  private timer: NodeJS.Timeout | null = null;
+  private keepalive: NodeJS.Timeout | null = null;
+
+  constructor(stateDir: string) {
+    this.stateDir = stateDir;
+    this.opened = openStateDir(stateDir);
+    this.snapshot = this.augment(this.opened, buildSnapshot(this.opened));
+    this.meta = metaKey(this.snapshot);
+    this.startWatch();
+    this.keepalive = setInterval(() => this.broadcastRaw(": ping\n\n"), 25000);
+    this.keepalive.unref?.();
+  }
+
+  private augment(opened: OpenedStateDir, snap: ReplaySnapshot): LiveSnapshot {
+    return Object.assign({}, snap, { chainVerify: computeChainVerify(opened, snap.frames) });
+  }
+
+  snapshotJson(): string {
+    return JSON.stringify(this.snapshot);
+  }
+
+  private startWatch(): void {
+    try {
+      this.watcher = watch(this.stateDir, { persistent: false }, (_ev, fname) => {
+        if (fname && !String(fname).startsWith("receipts")) return;
+        this.schedule();
+      });
+    } catch { /* fs.watch unsupported — replay still works, just not live */ }
+  }
+
+  private schedule(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.onChange(), 40); // debounce coalesces batch writes
+  }
+
+  private onChange(): void {
+    let next: LiveSnapshot;
+    let opened: OpenedStateDir;
+    try {
+      opened = openStateDir(this.stateDir);
+      next = this.augment(opened, buildSnapshot(opened));
+    } catch {
+      this.schedule(); // mid-rename / transient — retry shortly
+      return;
+    }
+    const prev = this.snapshot.frames;
+    const nf = next.frames;
+    const nextMeta = metaKey(next);
+    const framesContiguous = nf.length >= prev.length && prev.every((f, i) => nf[i]?.contentHash === f.contentHash);
+    const metaSame = nextMeta === this.meta;
+    this.opened = opened;
+    this.snapshot = next;
+    this.meta = nextMeta;
+    if (framesContiguous && metaSame && nf.length > prev.length) {
+      // Codex #2: only emit append deltas when the graph metadata is unchanged.
+      for (let i = prev.length; i < nf.length; i++) {
+        this.broadcast({ type: "receipt.appended", frame: nf[i]!, chainVerify: next.chainVerify });
+      }
+    } else if (!framesContiguous || !metaSame) {
+      this.broadcast({ type: "state.reset", snapshot: next });
+    }
+  }
+
+  private broadcast(ev: DevtoolsEvent): void {
+    this.broadcastRaw(`data: ${JSON.stringify(ev)}\n\n`);
+  }
+  private broadcastRaw(line: string): void {
+    for (const res of this.clients) this.write(res, line);
+  }
+  // Codex #4: back-pressure / disconnect aware — never buffer onto a dead socket.
+  private write(res: ServerResponse, line: string): void {
+    if (res.destroyed || res.writableEnded) { this.clients.delete(res); return; }
+    try {
+      const ok = res.write(line);
+      if (!ok) { /* slow consumer — drop it rather than buffer unboundedly */ res.end(); this.clients.delete(res); }
+    } catch { this.clients.delete(res); }
+  }
+
+  addClient(res: ServerResponse, after: number | null, hash: string | null): void {
+    const nf = this.snapshot.frames;
+    if (after !== null && Number.isFinite(after)) {
+      // Codex #1: the client's baseline is (index, hash). If the hash at `after`
+      // no longer matches, the ledger was reset/replaced — send a full reset
+      // instead of grafting new history onto the client's stale snapshot.
+      const baselineOk = after < 0 || (hash !== null && nf[after]?.contentHash === hash);
+      if (!baselineOk || after > nf.length - 1) {
+        this.write(res, `data: ${JSON.stringify({ type: "state.reset", snapshot: this.snapshot })}\n\n`);
+      } else {
+        for (let i = after + 1; i < nf.length; i++) {
+          this.write(res, `data: ${JSON.stringify({ type: "receipt.appended", frame: nf[i]!, chainVerify: this.snapshot.chainVerify })}\n\n`);
+        }
+      }
+    } else {
+      this.write(res, `data: ${JSON.stringify({ type: "hello", frames: nf.length })}\n\n`);
+    }
+    this.clients.add(res);
+    res.on("close", () => this.clients.delete(res));
+    res.on("error", () => this.clients.delete(res));
+  }
+
+  close(): void {
+    if (this.timer) clearTimeout(this.timer);
+    if (this.keepalive) clearInterval(this.keepalive);
+    this.watcher?.close();
+    for (const res of this.clients) { try { res.end(); } catch { /* ignore */ } }
+    this.clients.clear();
+  }
+}
+
+export async function startDevToolsServer(options: DevToolsServerOptions): Promise<DevToolsServer> {
   const port = options.port ?? DEFAULT_PORT;
   const host = options.host ?? DEFAULT_HOST;
-
-  const opened = openStateDir(options.stateDir);
-  const snapshot = buildSnapshot(opened);
-  const snapshotJson = JSON.stringify(snapshot);
+  const projector = new LiveProjector(options.stateDir);
   const assetsDir = publicDir();
-
-  const server = createServer((req, res) => {
-    handle(req, res, opened, snapshotJson, assetsDir);
-  });
+  const server = createServer((req, res) => handle(req, res, projector, assetsDir));
 
   await new Promise<void>((resolve, reject) => {
-    // Attach an 'error' listener BEFORE listen() so a bind failure (most
-    // commonly EADDRINUSE when the default port is already taken) rejects the
-    // Promise with a clean, actionable message instead of emitting an uncaught
-    // 'error' event that prints a raw Node stack trace and kills the process.
     const onError = (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        reject(
-          new Error(
-            `Port ${port} on ${host} is already in use. ` +
-              `Pass a different port with --port/-p (e.g. --port ${port + 1}).`,
-          ),
-        );
-      } else {
-        reject(err);
-      }
+      if (err.code === "EADDRINUSE") reject(new Error(`Port ${port} on ${host} is already in use. Pass a different port with --port/-p (e.g. --port ${port + 1}).`));
+      else reject(err);
     };
     server.once("error", onError);
-    server.listen(port, host, () => {
-      // Success: drop the bind-time error listener so it never fires for
-      // unrelated runtime errors later in the server's lifetime.
-      server.removeListener("error", onError);
-      resolve();
-    });
+    server.listen(port, host, () => { server.removeListener("error", onError); resolve(); });
   });
-  // Report the ACTUAL bound port, not the requested one — `port: 0` asks the OS
-  // for an ephemeral port (used by tests and any "just give me a free port"
-  // caller), so the URL must reflect what was assigned.
   const address = server.address();
-  const boundPort =
-    typeof address === "object" && address !== null ? address.port : port;
+  const boundPort = typeof address === "object" && address !== null ? address.port : port;
   const url = `http://${host}:${boundPort}/`;
   return {
     server,
     url,
-    snapshot,
-    close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve())),
-      ),
+    snapshot: projector.snapshot,
+    close: () => new Promise<void>((resolve, reject) => { projector.close(); server.close((err) => (err ? reject(err) : resolve())); }),
   };
 }
 
@@ -137,60 +235,44 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-function handle(
-  req: IncomingMessage,
-  res: ServerResponse,
-  opened: OpenedStateDir,
-  snapshotJson: string,
-  assetsDir: string,
-): void {
+function handle(req: IncomingMessage, res: ServerResponse, projector: LiveProjector, assetsDir: string): void {
   const url = req.url ?? "/";
   const path = url.split("?")[0] ?? "/";
 
-  // The S1/S2 feed. `/api/state` is the canonical name; `/api/snapshot` is kept
-  // as an alias for any earlier SPA build.
   if (path === "/api/state" || path === "/api/snapshot") {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    res.end(snapshotJson);
+    res.end(projector.snapshotJson());
     return;
   }
 
-  // S4 click-through: GET /api/node/:id?version=<atomicVersion>.
   if (path.startsWith("/api/node/")) {
     const node = decodeURIComponent(path.slice("/api/node/".length));
-    if (node.length === 0) {
-      sendJson(res, 400, { error: "missing node id" });
-      return;
-    }
+    if (node.length === 0) { sendJson(res, 400, { error: "missing node id" }); return; }
     const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
     const version = new URLSearchParams(qs).get("version");
-    if (version === null || version.length === 0) {
-      sendJson(res, 400, {
-        error: "missing ?version= (a frame's atomicVersion)",
-      });
-      return;
-    }
-    const view = readNodeWorldModel(opened, node, version);
-    if (view === null) {
-      sendJson(res, 404, { error: "no world-model for node@version", node, version });
-      return;
-    }
+    if (version === null || version.length === 0) { sendJson(res, 400, { error: "missing ?version= (a frame's atomicVersion)" }); return; }
+    const view = readNodeWorldModel(projector.opened, node, version);
+    if (view === null) { sendJson(res, 404, { error: "no world-model for node@version", node, version }); return; }
     sendJson(res, 200, view);
     return;
   }
 
   if (path === "/events") {
-    // S3 seam: hold the SSE channel open. In replay nothing is pushed.
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
+      "x-accel-buffering": "no",
     });
     res.write(": connected\n\n");
+    const qs = url.includes("?") ? url.slice(url.indexOf("?") + 1) : "";
+    const params = new URLSearchParams(qs);
+    const afterRaw = params.get("after");
+    const after = afterRaw === null ? null : Number.parseInt(afterRaw, 10);
+    projector.addClient(res, after, params.get("hash"));
     return;
   }
 
-  // Static SPA assets.
   const rel = path === "/" ? "index.html" : path.replace(/^\/+/, "");
   const safe = normalize(rel).replace(/^(\.\.[/\\])+/, "");
   const file = join(assetsDir, safe);
