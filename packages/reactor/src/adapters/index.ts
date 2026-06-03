@@ -9,6 +9,7 @@
 // adapter helpers. This is the seam consumers wire custom backends against.
 
 export * from "./agent-sdk-passthrough";
+export * from "./codex-render";
 export * from "./clock-system";
 // The one Substrate persistence primitive + its two named factories (durable /
 // ephemeral). One record `{ clock, storage, worldModel, ledger }` replacing the

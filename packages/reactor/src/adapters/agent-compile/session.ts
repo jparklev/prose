@@ -133,6 +133,51 @@ export interface CompileSessionConfig {
   readonly signal?: AbortSignal;
   /** Re-enable tracing with the consumer's own apiKey (default stays disabled). */
   readonly tracing?: boolean | TracingConfig;
+  /**
+   * Inject an alternate compile body executor (the {@link CompileBackend} seam —
+   * the compile-phase analogue of `RenderBackend`). When set, the session
+   * delegates its one structured-output model call to it instead of building the
+   * default `@openai/agents` Agent/Runner — so a Codex (or any non-SDK) backend
+   * runs compile KEYLESS, reusing the harness's instruction composition,
+   * contract-set evidence, and usage→cost mapping. Absent → the default path.
+   */
+  readonly compileBackend?: CompileBackend;
+}
+
+// ---------------------------------------------------------------------------
+// The CompileBackend port — the compile-phase analogue of RenderBackend
+// ---------------------------------------------------------------------------
+
+/**
+ * One compile session's harness-composed inputs. Typed structurally (no
+ * `@openai/agents`), so a non-SDK backend implements this without the peer dep.
+ * `outputType` / `model` / `modelSettings` are `unknown` — only the default
+ * `@openai/agents` path consumes those SDK shapes; an alternate backend reads the
+ * instructions + contract-set input and emits the structured artifact its own way.
+ */
+export interface CompileSessionRequest {
+  readonly step: CompileStep;
+  /** The composed SKILL + step task. */
+  readonly instructions: string;
+  /** The contract-set evidence (the run input). */
+  readonly input: string;
+  /** The step's structured-output schema (an `@openai/agents` AgentOutputType). */
+  readonly outputType: unknown;
+  readonly model: unknown;
+  readonly modelSettings: unknown;
+  readonly maxTurns: number | null;
+  readonly signal?: AbortSignal;
+}
+
+/** The raw output of one compile session: the structured artifact + token usage. */
+export interface CompileSessionOutput {
+  readonly output: unknown;
+  readonly usage: RenderUsage;
+}
+
+/** The injectable compile body executor. Mirrors `RenderBackend`. */
+export interface CompileBackend {
+  runSession(request: CompileSessionRequest): Promise<CompileSessionOutput>;
 }
 
 /**
@@ -190,6 +235,31 @@ export async function runCompileSession(
     config.agent?.modelSettings,
   );
 
+  const input = renderContractSet(contracts);
+
+  // CompileBackend seam: delegate the one structured-output call to an injected
+  // backend (e.g. Codex) — keyless, no `@openai/agents`. Mirrors the render seam.
+  // The default `@openai/agents` path below runs when no backend is injected.
+  if (config.compileBackend) {
+    const { output, usage } = await config.compileBackend.runSession({
+      step: config.step,
+      instructions,
+      input,
+      outputType: config.outputType,
+      model,
+      modelSettings,
+      maxTurns,
+      ...(config.signal !== undefined ? { signal: config.signal } : {}),
+    });
+    if (output === undefined || output === null) {
+      throw new Error(
+        `compile session '${config.step}' produced no structured output — the prior ` +
+          `compiled artifact stands (architecture.md §8: failed compile)`,
+      );
+    }
+    return { output, cost: usageToCost(usage, "self" satisfies WakeSource) };
+  }
+
   // The consumer's `agent.*` passthrough FIRST (lowest precedence); the reserved
   // four below always win. Assembled once + cast at the single SDK-coupling point
   // — the passthrough is a `Partial<AgentConfiguration>` over the SDK default
@@ -204,8 +274,6 @@ export async function runCompileSession(
     outputType: config.outputType,
   } as unknown as AgentConfiguration;
   const agent = new Agent(agentOptions);
-
-  const input = renderContractSet(contracts);
 
   const provider = config.provider ?? createOpenRouterProvider();
   const runner = new Runner(
