@@ -23,3 +23,7 @@ openprose-smoke-results/
 AGENTS.override.md
 CLAUDE.local.md
 .reactor/
+
+# Generated devtools viewer bundle (build with scripts/build-viewer.mjs)
+packages/reactor-devtools/src/public/viewer.bundle.js
+packages/reactor-devtools/src/public/viewer.bundle.js.map
