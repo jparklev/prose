@@ -24,8 +24,10 @@ import {
   buildSnapshot,
   readNodeWorldModel,
   verifyNodeChainRaw,
+  evaluateInvariants,
   type OpenedStateDir,
   type ReplaySnapshot,
+  type InvariantBreach,
 } from "../data";
 
 export interface DevToolsServerOptions {
@@ -66,11 +68,15 @@ function contentTypeFor(path: string): string {
 }
 
 type Frame = ReplaySnapshot["frames"][number];
-// The snapshot we serve, augmented with per-node chain-verify (committed-fact
-// tamper evidence the viewer turns into a `chain-verify-break` surprise).
-type LiveSnapshot = ReplaySnapshot & { chainVerify: Record<string, boolean> };
+// The snapshot we serve, augmented with two observer-side properties OF the
+// committed trail the viewer turns into surprises: per-node chain-verify
+// (`chain-verify-break`) and sideband invariant breaches (`invariant-failed`).
+type LiveSnapshot = ReplaySnapshot & {
+  chainVerify: Record<string, boolean>;
+  invariants: readonly InvariantBreach[];
+};
 type DevtoolsEvent =
-  | { type: "receipt.appended"; frame: Frame; chainVerify: Record<string, boolean> }
+  | { type: "receipt.appended"; frame: Frame; chainVerify: Record<string, boolean>; invariants: readonly InvariantBreach[] }
   | { type: "state.reset"; snapshot: LiveSnapshot }
   | { type: "hello"; frames: number };
 
@@ -109,7 +115,10 @@ class LiveProjector {
   }
 
   private augment(opened: OpenedStateDir, snap: ReplaySnapshot): LiveSnapshot {
-    return Object.assign({}, snap, { chainVerify: computeChainVerify(opened, snap.frames) });
+    return Object.assign({}, snap, {
+      chainVerify: computeChainVerify(opened, snap.frames),
+      invariants: evaluateInvariants(opened, snap.frames),
+    });
   }
 
   snapshotJson(): string {
@@ -151,7 +160,7 @@ class LiveProjector {
     if (framesContiguous && metaSame && nf.length > prev.length) {
       // Codex #2: only emit append deltas when the graph metadata is unchanged.
       for (let i = prev.length; i < nf.length; i++) {
-        this.broadcast({ type: "receipt.appended", frame: nf[i]!, chainVerify: next.chainVerify });
+        this.broadcast({ type: "receipt.appended", frame: nf[i]!, chainVerify: next.chainVerify, invariants: next.invariants });
       }
     } else if (!framesContiguous || !metaSame) {
       this.broadcast({ type: "state.reset", snapshot: next });
@@ -184,7 +193,7 @@ class LiveProjector {
         this.write(res, `data: ${JSON.stringify({ type: "state.reset", snapshot: this.snapshot })}\n\n`);
       } else {
         for (let i = after + 1; i < nf.length; i++) {
-          this.write(res, `data: ${JSON.stringify({ type: "receipt.appended", frame: nf[i]!, chainVerify: this.snapshot.chainVerify })}\n\n`);
+          this.write(res, `data: ${JSON.stringify({ type: "receipt.appended", frame: nf[i]!, chainVerify: this.snapshot.chainVerify, invariants: this.snapshot.invariants })}\n\n`);
         }
       }
     } else {

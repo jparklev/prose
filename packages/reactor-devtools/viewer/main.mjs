@@ -247,7 +247,7 @@ function ledgerTable(frames, labels) {
 const VERDICT_RE = /verdict|risk|status|gate|level|decision|alert/i;
 const median = (xs) => { if (!xs.length) return 0; const s = [...xs].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
 
-function projectSurprises(frames, chainVerify) {
+function projectSurprises(frames, chainVerify, invariants) {
   const events = [];
   const hist = new Map(); // node -> prior nonzero fresh costs (chronological)
   for (const f of frames) {
@@ -278,20 +278,30 @@ function projectSurprises(frames, chainVerify) {
   // chain-verify-break: a node whose committed receipt chain fails to verify
   // (a content hash ≠ its payload). Server-computed over the RAW on-disk
   // receipts; does not auto-resolve. Surfaced once the node is in scrubbed range.
+  const lastIdx = new Map();
+  for (const f of frames) lastIdx.set(f.node, f.index);
   if (chainVerify) {
-    const lastIdx = new Map();
-    for (const f of frames) lastIdx.set(f.node, f.index);
     for (const [node, ok] of Object.entries(chainVerify)) {
       if (!ok && lastIdx.has(node)) {
         events.push({ id: `chain:${node}`, cause: "chain-verify-break", severity: "block", node, frameIndex: lastIdx.get(node), reason: "receipt chain failed to verify — a content hash does not match its payload", status: "active" });
       }
     }
   }
+  // invariant-failed: a declared truth invariant (the observability.json sidecar)
+  // the node's LATEST committed truth violates. Server-computed against the truth;
+  // SIDEBAND — never gated a wake. Surfaced once the head reaches the node's last
+  // frame (where the offending truth was committed), like chain-verify-break.
+  if (invariants) {
+    for (const b of invariants) {
+      const within = lastIdx.has(b.node) && b.frameIndex <= lastIdx.get(b.node);
+      if (within) events.push({ id: `inv:${b.id}`, cause: "invariant-failed", severity: b.severity || "warn", node: b.node, frameIndex: b.frameIndex, reason: `${b.label} — ${b.reason}`, status: "active" });
+    }
+  }
   return events;
 }
 
-function renderTray(frames, labels, acked, jump, ack, chainVerify) {
-  const events = projectSurprises(frames, chainVerify);
+function renderTray(frames, labels, acked, jump, ack, chainVerify, invariants) {
+  const events = projectSurprises(frames, chainVerify, invariants);
   for (const e of events) if (acked.has(e.id)) e.status = "acknowledged";
   const SEV = { block: 0, warn: 1, info: 2 };
   const active = events.filter((e) => e.status === "active").sort((a, b) => SEV[a.severity] - SEV[b.severity] || b.frameIndex - a.frameIndex);
@@ -433,7 +443,9 @@ async function boot() {
       es.addEventListener("message", (e) => {
         let msg; try { msg = JSON.parse(e.data); } catch { return; }
         if (msg.type === "receipt.appended") {
-          snapshot = { ...snapshot, frames: [...snapshot.frames, msg.frame] };
+          // merge the server's freshly-computed observer-side properties so the
+          // live tray (chain-verify / invariant breaches) tracks the new truth.
+          snapshot = { ...snapshot, frames: [...snapshot.frames, msg.frame], chainVerify: msg.chainVerify ?? snapshot.chainVerify, invariants: msg.invariants ?? snapshot.invariants };
           transport.grow(snapshot.frames); // extend the range; follow the edge
           counts();
           footState.textContent = "● live"; footState.style.color = "var(--accent)";
@@ -472,7 +484,7 @@ async function boot() {
   main.variable(into("#cell-dag")).define("dag", ["snapshot", "head", "dagMode"], (s, h, m) => renderDag(s, layout, h, m));
   main.variable(into("#cell-cost")).define("costChart", ["framesUpTo", "theme", "snapshot"], (f, t, s) => costChart(f, t, s.frames.length));
   main.variable(into("#cell-dispo")).define("dispoCell", ["framesUpTo", "rate"], (f, r) => dispo(f, labels, r));
-  main.variable(into("#cell-tray")).define("trayCell", ["framesUpTo", "ack", "snapshot"], (f, a, s) => renderTray(f, labels, acked, goto, toggleAck, s.chainVerify));
+  main.variable(into("#cell-tray")).define("trayCell", ["framesUpTo", "ack", "snapshot"], (f, a, s) => renderTray(f, labels, acked, goto, toggleAck, s.chainVerify, s.invariants));
   // Dataflow — lean into the runtime: the live derived state as the iconic
   // expandable Inspector tree, and the ledger as a sortable Inputs.table.
   main.variable(new Inspector(document.querySelector("#cell-inspector"))).define("dataflow", ["framesUpTo", "snapshot"], (framesUpTo, s) => ({
@@ -481,6 +493,7 @@ async function boot() {
     nodes: s.nodes.map((n) => n.id),
     edges: s.edges,
     chainVerify: s.chainVerify,
+    invariants: s.invariants,
   }));
   main.variable(into("#cell-ledger-table")).define("ledgerTable", ["framesUpTo"], (f) => ledgerTable(f, labels));
 

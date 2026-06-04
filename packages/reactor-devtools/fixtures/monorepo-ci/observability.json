@@ -1,0 +1,23 @@
+{
+  "_comment": "Sideband observability invariants — declared truth properties an external observability layer wants surfaced. The reactor engine NEVER reads this file; only the read-only devtools projection does. Each breach becomes an `invariant-failed` surprise in the tray. `path` is a dot-path into the node's structured truth; `op` ∈ lt|lte|gt|gte|eq|neq.",
+  "invariants": [
+    {
+      "id": "typecheck-budget",
+      "node": "gate.merge",
+      "path": "typecheck",
+      "op": "lte",
+      "value": 8,
+      "label": "typecheck revision budget ≤ 8",
+      "severity": "warn"
+    },
+    {
+      "id": "merge-green",
+      "node": "gate.merge",
+      "path": "merge",
+      "op": "eq",
+      "value": "GREEN",
+      "label": "merge gate stays GREEN",
+      "severity": "block"
+    }
+  ]
+}

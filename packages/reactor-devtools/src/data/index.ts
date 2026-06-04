@@ -469,6 +469,146 @@ export function versionForFrame(frame: ReceiptFrame): string {
   return frame.atomicVersion;
 }
 
+// --- Sideband INVARIANTS (the observability sidecar) ------------------------
+// A render's maintained TRUTH can carry invariants an external observability
+// layer wants surfaced — "merge gate stays GREEN", "typecheck revisions ≤ 8". An
+// invariant is SIDEBAND: derived attention layered ON TOP of the committed ledger,
+// never part of a fingerprint and never gating a wake. The reactor engine NEVER
+// reads this file — ONLY the read-only devtools projection does (this is the same
+// posture as chain-verify: a property OF the committed trail, computed observer-
+// side). The viewer turns each breach into an `invariant-failed` surprise.
+//
+// `<state-dir>/observability.json`:
+//   { "invariants": [ { id, node, path, op, value, label?, severity? } ] }
+// `path` is a dot-path into the node's structured truth; `op` ∈ lt|lte|gt|gte|eq|neq.
+
+export type InvariantOp = "lt" | "lte" | "gt" | "gte" | "eq" | "neq";
+
+export interface InvariantSpec {
+  readonly id: string;
+  readonly node: string;
+  readonly path: string;
+  readonly op: InvariantOp;
+  readonly value: unknown;
+  readonly label?: string;
+  readonly severity?: "block" | "warn" | "info";
+}
+
+export interface InvariantBreach {
+  readonly id: string;
+  readonly node: string;
+  /** The node's last committed frame — the breach surfaces once the head reaches it. */
+  readonly frameIndex: number;
+  readonly severity: "block" | "warn" | "info";
+  readonly label: string;
+  readonly reason: string;
+  readonly observed: unknown;
+}
+
+const OP_SYMBOL: Record<InvariantOp, string> = {
+  lt: "<", lte: "≤", gt: ">", gte: "≥", eq: "=", neq: "≠",
+};
+
+/** Read the optional `<state-dir>/observability.json` invariant specs (best-effort). */
+export function readObservabilitySidecar(stateDir: string): InvariantSpec[] {
+  const file = join(stateDir, "observability.json");
+  if (!existsSync(file)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    const raw = Array.isArray(parsed)
+      ? parsed
+      : (parsed as { invariants?: unknown } | null)?.invariants;
+    if (!Array.isArray(raw)) return [];
+    return raw.filter(
+      (x): x is InvariantSpec =>
+        x !== null && typeof x === "object" &&
+        typeof (x as InvariantSpec).id === "string" &&
+        typeof (x as InvariantSpec).node === "string" &&
+        typeof (x as InvariantSpec).path === "string" &&
+        typeof (x as InvariantSpec).op === "string" &&
+        (x as InvariantSpec).op in OP_SYMBOL,
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** The structured-JSON convention: a node's truth out of whatever .json it wrote. */
+function parseNodeTruth(
+  files: readonly WorldModelFileView[],
+): Record<string, unknown> | null {
+  const json = files.filter((f) => f.path.toLowerCase().endsWith(".json"));
+  const read = (f: WorldModelFileView): unknown => {
+    if (typeof f.text !== "string") return undefined;
+    try { return JSON.parse(f.text); } catch { return undefined; }
+  };
+  const prefer =
+    json.find((f) => /(?:^|\/)(?:truth|world-model)\.json$/i.test(f.path)) ??
+    (json.length === 1 ? json[0] : undefined);
+  if (prefer) {
+    const v = read(prefer);
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      return v as Record<string, unknown>;
+    }
+  }
+  return null;
+}
+
+function resolvePath(obj: unknown, path: string): unknown {
+  let cur: unknown = obj;
+  for (const seg of path.split(".")) {
+    if (cur === null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+function invariantHolds(observed: unknown, op: InvariantOp, value: unknown): boolean {
+  if (op === "eq") return observed === value;
+  if (op === "neq") return observed !== value;
+  const a = Number(observed), b = Number(value);
+  if (Number.isNaN(a) || Number.isNaN(b)) return false;
+  return op === "lt" ? a < b : op === "lte" ? a <= b : op === "gt" ? a > b : a >= b;
+}
+
+/**
+ * Evaluate the sidecar invariants against each node's LATEST committed truth and
+ * return the BREACHES (violated invariants). `frameIndex` is the node's last frame,
+ * so a breach surfaces once the scrub head reaches the frame that committed the
+ * offending truth — mirroring chain-verify-break. Reactor never calls this.
+ */
+export function evaluateInvariants(
+  opened: OpenedStateDir,
+  frames: readonly ReceiptFrame[],
+  specs?: readonly InvariantSpec[],
+): InvariantBreach[] {
+  const invariants = specs ?? readObservabilitySidecar(opened.stateDir);
+  if (invariants.length === 0) return [];
+  const lastFrame = new Map<string, ReceiptFrame>();
+  for (const f of frames) lastFrame.set(f.node, f);
+  const breaches: InvariantBreach[] = [];
+  for (const inv of invariants) {
+    const lf = lastFrame.get(inv.node);
+    if (lf === undefined) continue;
+    const wm = readNodeWorldModel(opened, inv.node, lf.atomicVersion);
+    const truth = wm ? parseNodeTruth(wm.files) : null;
+    if (truth === null) continue;
+    const observed = resolvePath(truth, inv.path);
+    if (observed === undefined) continue;
+    if (invariantHolds(observed, inv.op, inv.value)) continue; // satisfied
+    breaches.push({
+      id: inv.id,
+      node: inv.node,
+      frameIndex: lf.index,
+      severity: inv.severity ?? "warn",
+      label: inv.label ?? `${inv.node}.${inv.path} ${OP_SYMBOL[inv.op]} ${JSON.stringify(inv.value)}`,
+      observed,
+      reason: `${inv.path} = ${JSON.stringify(observed)} violates ${OP_SYMBOL[inv.op]} ${JSON.stringify(inv.value)}`,
+    });
+  }
+  return breaches;
+}
+
 // --- The wire payload (what the SPA consumes) -------------------------------
 
 /**
@@ -870,6 +1010,13 @@ export interface DescribeData {
     readonly ok: boolean;
     readonly errors: readonly string[];
   };
+  /**
+   * Sideband invariant breaches from the optional `<state-dir>/observability.json`
+   * (omitted entirely when the sidecar is absent / nothing breached). Each is a
+   * declared truth invariant the latest committed world-model violates — surfaced
+   * as an `invariant-failed` surprise in the viewer; never gates a wake.
+   */
+  readonly invariants?: readonly InvariantBreach[];
 }
 
 /** Friendly label for a node, falling back to the structural short name. */
@@ -1163,6 +1310,22 @@ export function describeStateDir(
     for (const e of chainErrors) lines.push(e);
   }
 
+  // ---- INVARIANTS (sideband — the observability.json sidecar) ----
+  // Computed by the SAME shared evaluator the live server attaches to the snapshot,
+  // so the headless `--describe` and the viewer's surprise tray agree byte-for-byte.
+  const invariantBreaches = evaluateInvariants(opened, snapshot.frames);
+  if (invariantBreaches.length > 0) {
+    lines.push("");
+    lines.push(
+      `INVARIANTS  ${invariantBreaches.length} breached (sideband — observability.json, never gates a wake)`,
+    );
+    for (const b of invariantBreaches) {
+      lines.push(
+        `  [${W(b.severity, 5)}] ${W(labelFor(snapshot, b.node, useLabels), 24)} ${b.label} — ${b.reason} @ frame ${b.frameIndex}`,
+      );
+    }
+  }
+
   // ---- per-frame "what happened" ----
   lines.push("");
   lines.push(
@@ -1246,6 +1409,7 @@ export function describeStateDir(
         ok: chainOk,
         errors: chainErrors.map((e) => e.trim()),
       },
+      ...(invariantBreaches.length > 0 ? { invariants: invariantBreaches } : {}),
     },
   };
 }
