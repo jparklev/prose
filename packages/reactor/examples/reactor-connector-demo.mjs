@@ -21,30 +21,17 @@ let feed = []; // the connector's source: a growing JSON array keyed by `id`
 // / non-plain object), so `async () => feed` would throw on the Promise.
 const signalsConnector = { node: "signals", source_id: "signals", fetch: () => feed };
 
-// THE #12 FIX: a truth projection. The facade defaults projectTruthFor to
-// EMPTY_PROJECTION (() => {}), so EVERY node's canonicalizer reduces an empty
-// truth → its @atomic fingerprint is the constant sha256("null") → it never
-// "moves" → no update ever propagates. We supply a real projection that parses
-// the render's STRUCTURED truth out of whatever .json file it wrote (the Codex
-// render names it signal.json / world-model.json), so the fingerprint tracks the
-// content and a changed truth wakes downstream subscribers.
-const _dec = new TextDecoder();
-function projectTruth(files) {
-  const names = Object.keys(files).filter((k) => k.toLowerCase().endsWith(".json"));
-  const read = (name) => { try { return JSON.parse(_dec.decode(files[name])); } catch { return undefined; } };
-  const prefer = names.find((n) => /world-model|truth/i.test(n)) ?? (names.length === 1 ? names[0] : undefined);
-  if (prefer) { const v = read(prefer); if (v && typeof v === "object") return v; }
-  const merged = {};
-  for (const n of names) { const v = read(n); if (v && typeof v === "object") Object.assign(merged, v); }
-  return merged;
-}
-
+// THE #12 FIX, now PROMOTED into the facade: a truth projection makes each node's
+// canonicalizer fingerprint MOVE when its structured truth changes (without one,
+// every node reduces an empty truth → the constant sha256("null") → nothing ever
+// propagates). The facade now DEFAULTS `projectTruthFor` to the structured-JSON
+// `conventionTruthProjection` (parse the render's truth out of whatever .json it
+// wrote — signal.json / world-model.json), so this demo no longer wires it by
+// hand. Pass `render: { projectTruthFor }` only when a contract lays truth out
+// differently from the convention.
 const { reactor: r, pollConnectors } = await reactor(project, {
   directory: state,
   compile: { skipPostconditions: true, options: { compileBackend: createCodexCompileBackend({ sandboxMode: "read-only" }) } },
-  // projectTruthFor (#12 fix): project each node's structured truth so its
-  // canonicalizer fingerprint MOVES when the truth changes → updates propagate.
-  render: { projectTruthFor: () => projectTruth },
   adapters: { renderBackend: createCodexRenderBackend({ sandboxMode: "workspace-write" }), connectors: [signalsConnector] },
 });
 

@@ -34,6 +34,7 @@ import type { NodeFreshnessReader } from "./continuity-scheduler";
 import type { Reactor } from "./reactor-handle";
 import type { ReconcileResult } from "../reactor";
 import type { CompileProjectInput, RunProjectRender } from "./run-project";
+import { conventionTruthProjection } from "./render-atom";
 import {
   augmentTopologyWithIngress,
   armConnectors,
@@ -281,11 +282,23 @@ function resolveRender(options: ReactorOptions): RunProjectRender {
   // Omitted → the default `@openai/agents` backend, so the default render is
   // byte-for-byte what it was before this seam was surfaced on the facade.
   const renderBackend = options.adapters?.renderBackend;
+  // Batteries-included default (the facade layer): when the caller omits a truth
+  // projection, fall back to the structured-JSON CONVENTION projection so a
+  // producer's facet fingerprint MOVES with its content and updates propagate —
+  // the #12 fix promoted off the example and into the front door. The strict
+  // kernel (`runProject`) keeps EMPTY_PROJECTION + the GOTCHA-1 guard (it invents
+  // no file-name convention); the facade is exactly where a sensible default
+  // lives. An explicit `render.projectTruthFor` always wins.
+  const projectTruthDefault =
+    r.projectTruthFor === undefined
+      ? { projectTruthFor: () => conventionTruthProjection }
+      : {};
   // The spread is shape-compatible with RunProjectRender; the localized assertion
   // only suppresses exactOptionalPropertyTypes widening optionals to `| undefined`.
   // (Keeps the flagship call site cast-free.)
   return {
     ...r,
+    ...projectTruthDefault,
     ...(renderBackend !== undefined ? { renderBackend } : {}),
   } as RunProjectRender;
 }

@@ -12,6 +12,7 @@ export {
   renderAtomAsync,
   zeroCost,
   compiledStoreCanonicalizer,
+  conventionTruthProjection,
   type RenderAtomInput,
   type RenderAtomAsyncInput,
   type RenderAtomResult,

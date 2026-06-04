@@ -149,6 +149,41 @@ test("reactor() facade: one call compiles + boots the fixture and returns the ty
   }
 });
 
+test("reactor() facade: propagation works WITHOUT an explicit projectTruthFor (convention default)", async () => {
+  const wm = tmp("opfacade-conv-");
+  try {
+    // NO `projectTruthFor` is supplied — the facade defaults to the structured-
+    // JSON convention projection. The monitor writes the sole `state/funding.json`,
+    // so the convention reads it as the node's structured truth, the `funding`
+    // facet fingerprint MOVES off cold-start, and the brief wakes via the
+    // propagated facet — the #12 footgun (EMPTY_PROJECTION → constant
+    // sha256("null") → no propagation) is gone at the front door.
+    const { reactor: r, bootResults } = await reactor(FIXTURE_DIR, {
+      adapters: {
+        storage: createMemoryStorageAdapter(),
+        worldModel: new FileSystemWorldModelStore({ directory: wm }),
+      },
+      render: { buildRender: buildFakeRender }, // ← no projectTruthFor
+      compile: COMPILE,
+    });
+
+    // Both nodes rendered at boot: the brief could only wake if `funding`
+    // propagated, which only happens if the convention projected the monitor's
+    // structured truth (not the empty projection).
+    equal(bootResults.length >= 2, true);
+    const briefRead = r.store.read(BRIEF, "published");
+    equal(
+      readTextFile(briefRead.files[BRIEF_PATH] as Uint8Array),
+      "brief derived from funding",
+    );
+    // The monitor's `funding` facet is a real (non-null) fingerprint, not the
+    // sha256("null") constant the empty projection would have produced.
+    ok(r.store.publishedFingerprints(MONITOR)["funding"] !== undefined);
+  } finally {
+    rmSync(wm, { recursive: true, force: true });
+  }
+});
+
 test("reactor() facade: the in-memory posture (no directory) boots ephemerally", async () => {
   const { reactor: r, bootResults } = await reactor(FIXTURE_DIR, {
     render: { buildRender: buildFakeRender, projectTruthFor },

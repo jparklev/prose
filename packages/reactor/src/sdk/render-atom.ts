@@ -186,6 +186,53 @@ export interface RenderAtomResult {
  */
 export type TruthProjection = (files: WorldModelFiles) => WorldModelValue;
 
+const _conventionDecoder = new TextDecoder();
+
+/**
+ * The batteries-included "structured-JSON convention" truth projection the FACADE
+ * (`reactor()`) defaults to when a caller omits an explicit `projectTruthFor`.
+ *
+ * The strict kernel (`runProject`) deliberately invents NO file-name convention —
+ * its default is the empty projection guarded by GOTCHA-1, because the projection
+ * is meant to travel with the contract (the §3.2 structured-backing boundary). But
+ * the ergonomic facade layer is exactly where a sensible default belongs: most
+ * renders lay their structured truth out as JSON, so this projection reads the
+ * producer's world-model out of whatever `.json` file it wrote — preferring an
+ * explicit `world-model.json` / `truth.json`, else the sole `.json`, else a
+ * shallow merge of every `.json`. A non-JSON / prose-only producer projects to
+ * `{}` (the empty truth) — exactly what the kernel default would yield — so the
+ * convention NEVER fabricates structure that isn't on disk. Supply your own
+ * `render.projectTruthFor` to override it whenever a contract lays truth out
+ * differently.
+ */
+export const conventionTruthProjection: TruthProjection = (files) => {
+  const names = Object.keys(files).filter((k) =>
+    k.toLowerCase().endsWith(".json"),
+  );
+  const read = (name: string): WorldModelValue | undefined => {
+    try {
+      return JSON.parse(_conventionDecoder.decode(files[name])) as WorldModelValue;
+    } catch {
+      return undefined;
+    }
+  };
+  const prefer =
+    names.find((n) => /(?:^|\/)(?:world-model|truth)\.json$/i.test(n)) ??
+    (names.length === 1 ? names[0] : undefined);
+  if (prefer !== undefined) {
+    const v = read(prefer);
+    if (v !== null && typeof v === "object") return v;
+  }
+  const merged: Record<string, WorldModelValue> = {};
+  for (const n of names) {
+    const v = read(n);
+    if (v !== null && typeof v === "object" && !Array.isArray(v)) {
+      Object.assign(merged, v);
+    }
+  }
+  return merged;
+};
+
 /**
  * Adapt a COMPILED per-node canonicalizer (the compile-phase artifact, operating
  * on the structured `WorldModelValue`, architecture.md §3.2 L138–L143;
