@@ -1,18 +1,27 @@
-// Reactor DevTools — the Observable reactive viewer (notebook-kit runtime).
+// Reactor DevTools — the Observable reactive viewer.
 //
-// The view is a reactive Observable DAG projecting Reactor's receipt ledger.
-// Three source cells are the redefinable seams (zenbu's variable.define
-// redefine-in-place pattern): `snapshot` (the /api/state baseline; later SSE
-// state.reset), `head` (the scrub index; advanced by the transport / SSE
-// receipt.appended), and `theme`. Redefining any recomputes downstream — the
-// dependency graph, the cost chart, the surprise tray — reactively.
+// The view is a reactive Observable notebook projecting Reactor's receipt ledger.
+// Two source cells are GENERATORS the runtime drives natively (lean into the
+// runtime — no manual variable.define redefine-in-place):
+//   • `snapshot` = Generators.observe over the SSE stream: the /api/state baseline,
+//     then each receipt.appended / state.reset pushed as a new value.
+//   • `head`     = Generators.input over a `viewof` transport (the scrubber): the
+//     scrub index, advanced by the slider / play / keyboard / live-edge follow.
+// Every downstream cell — the dependency DAG, the cost chart, the surprise tray,
+// the Inspector dataflow tree, the Inputs.table ledger — reactively depends on
+// those two generators (+ the theme / dag-mode / rate / ack control vars), so a
+// pushed frame or a scrub recomputes exactly what changed.
 //
-// Bundled by scripts/build-viewer.mjs (esbuild, vendored, offline) to
+// Generators.observe / .input are faithful local ports in obs.mjs (the runtime
+// ships only the scheduler, not the stdlib Library). Bundled by
+// scripts/build-viewer.mjs (esbuild, vendored, offline) to
 // src/public/viewer.bundle.js and loaded by /viewer.html.
 
 import { Runtime } from "@observablehq/runtime";
 import { Inspector } from "@observablehq/inspector";
 import * as Plot from "@observablehq/plot";
+import * as Inputs from "@observablehq/inputs";
+import { observe, input as inputGen } from "./obs.mjs";
 
 const SVG = "http://www.w3.org/2000/svg";
 const GEOM = { nodeW: 158, nodeH: 48, colGap: 66, rowGap: 16, padX: 16, padY: 16 };
@@ -201,6 +210,35 @@ function dispo(frames, labels, rate) {
       ` api-equiv`));
 }
 
+// ---- the ledger as a sortable Inputs.table (Observable idiom) --------------
+// One row per committed receipt frame ≤ head, columns sorted/​reversed so the
+// newest disposition is on top. Click a column header to re-sort — the receipt
+// ledger as a first-class Observable input.
+function ledgerTable(frames, labels) {
+  const rows = frames.map((f) => ({
+    "#": f.index,
+    node: shortName(f.node, labels),
+    status: f.status,
+    fresh: f.cost.fresh,
+    reused: f.cost.reused,
+    moved: (f.movedFacets || []).join(", "),
+    cause: f.cost.surpriseCause ?? "",
+  }));
+  return Inputs.table(rows, {
+    columns: ["#", "node", "status", "fresh", "reused", "moved", "cause"],
+    header: { "#": "#", fresh: "fresh tok", reused: "reused tok" },
+    sort: "#",
+    reverse: true,
+    rows: 13,
+    width: { "#": 40, status: 86, fresh: 78, reused: 80 },
+    format: {
+      fresh: (v) => v.toLocaleString(),
+      reused: (v) => v.toLocaleString(),
+      status: (v) => Object.assign(document.createElement("span"), { className: `tbl-status s-${v}`, textContent: v }),
+    },
+  });
+}
+
 // ---- surprise projection: pure functions over committed facts -------------
 // Surprises are DERIVED from the committed receipt frames (+ moved facets). They
 // never gate wake/commit — they are sideband attention. Per Gemini's review:
@@ -277,6 +315,66 @@ function renderTray(frames, labels, acked, jump, ack, chainVerify) {
   return wrap;
 }
 
+// ---- the `viewof` transport: a scrubber over the existing transport DOM -------
+// Wraps the styled #t-start/#t-play/#t-end/#seek/#readout controls into ONE
+// element whose `.value` is the scrub head (an int in [-1, max]) and which
+// dispatches "input" on change — so `Generators.input(scrubber.host)` makes `head`
+// a reactive cell. Owns play/pause, keyboard (space / ←→), and live growth
+// (`grow` bumps the range max and follows the edge as frames stream in).
+function makeScrubber(initialFrames, labels) {
+  const host = document.querySelector(".transport");
+  const seek = document.querySelector("#seek");
+  const readout = document.querySelector("#readout");
+  const playBtn = document.querySelector("#t-play");
+  let frames = initialFrames;
+  let max = frames.length - 1;
+  let head = max;
+  let timer = null;
+
+  // `host.value` IS the head — what Generators.input reads on each "input".
+  Object.defineProperty(host, "value", { get: () => head, configurable: true });
+  const emit = () => host.dispatchEvent(new Event("input", { bubbles: true }));
+  const sync = () => {
+    seek.min = "-1"; seek.max = String(max); seek.value = String(head);
+    const f = head >= 0 ? frames[head] : null;
+    readout.innerHTML = f
+      ? `frame <b>${head}</b>/${max} · ${shortName(f.node, labels)} · ${f.status}`
+      : `frame —/${max}`;
+  };
+  const set = (i, silent = false) => { head = Math.max(-1, Math.min(max, i)); sync(); if (!silent) emit(); };
+  const stop = () => { if (timer) { clearInterval(timer); timer = null; playBtn.textContent = "▶"; } };
+  const play = () => {
+    if (timer) return stop();
+    if (head >= max) set(-1);
+    playBtn.textContent = "⏸";
+    timer = setInterval(() => { if (head >= max) return stop(); set(head + 1); }, 320);
+  };
+
+  playBtn.onclick = play;
+  document.querySelector("#t-start").onclick = () => { stop(); set(-1); };
+  document.querySelector("#t-end").onclick = () => { stop(); set(max); };
+  seek.oninput = () => { stop(); set(parseInt(seek.value, 10)); };
+  window.addEventListener("keydown", (e) => {
+    if (e.target && /^(input|textarea|select)$/i.test(e.target.tagName)) return;
+    if (e.key === " ") { e.preventDefault(); play(); }
+    else if (e.key === "ArrowRight") { stop(); set(head + 1); }
+    else if (e.key === "ArrowLeft") { stop(); set(head - 1); }
+  });
+
+  sync(); // reflect the initial head (the edge) in the slider + readout on boot
+
+  return {
+    host,
+    setLabels(l) { labels = l; },
+    // jump to a frame (the surprise tray's click-through) — stop playback, seek.
+    goto(i) { stop(); set(i); },
+    // a frame streamed in: extend the range; follow the edge iff we were parked there.
+    grow(next) { const wasEdge = head >= max; frames = next; max = frames.length - 1; if (wasEdge) set(max); else sync(); },
+    // a full state.reset: re-baseline and jump to the new edge.
+    reset(next) { frames = next; max = frames.length - 1; stop(); set(max); },
+  };
+}
+
 async function boot() {
   let snapshot = await (await fetch("/api/state")).json();
   let labels = snapshot.labels || {};
@@ -306,44 +404,85 @@ async function boot() {
     localStorage.setItem("reactor-devtools-theme", t);
   };
 
-  // --- runtime ---
+  // --- runtime: the two source generators + the discrete control vars ---------
   const runtime = new Runtime();
   const main = runtime.module();
-  const snapshotVar = main.variable();
-  snapshotVar.define("snapshot", [], () => snapshot);
-  let head = N - 1;
-  const headVar = main.variable();
-  const setHead = (i) => { head = Math.max(-1, Math.min(snapshot.frames.length - 1, i)); headVar.define("head", [], () => head); syncTransport(); };
-  const themeVar = main.variable();
+  const footState = document.querySelector("#foot-state");
+
+  // `head` = Generators.input over the `viewof` transport (scrubber). A reactive
+  // cell: scrub / play / keyboard / live-edge-follow all flow through the host's
+  // "input" event.
+  const transport = makeScrubber(snapshot.frames, labels);
+  const goto = (i) => transport.goto(i);
+  window.__reactorSetHead = goto; // Chrome-driving hook (e2e walkthroughs)
+  main.variable().define("head", [], () => inputGen(transport.host));
+
+  // `snapshot` = Generators.observe over the SSE stream. The initial /api/state is
+  // the first push; every receipt.appended extends it, every state.reset replaces
+  // it. The generator owns the live wire — the transport follows the edge and the
+  // header/footer update as values flow, then `change(snap)` recomputes the graph.
+  main.variable().define("snapshot", [], () =>
+    observe((change) => {
+      change(snapshot);
+      let es;
+      try {
+        const lastHash = snapshot.frames[snapshot.frames.length - 1]?.contentHash || "";
+        es = new EventSource(`/events?after=${snapshot.frames.length - 1}&hash=${encodeURIComponent(lastHash)}`);
+      } catch { return undefined; } // no EventSource — static replay over the baseline
+      const counts = () => { document.querySelector("#nb-counts").textContent = `${snapshot.frames.length} receipts · ${snapshot.nodes.length} nodes · ${snapshot.edges.length} edges`; };
+      es.addEventListener("message", (e) => {
+        let msg; try { msg = JSON.parse(e.data); } catch { return; }
+        if (msg.type === "receipt.appended") {
+          snapshot = { ...snapshot, frames: [...snapshot.frames, msg.frame] };
+          transport.grow(snapshot.frames); // extend the range; follow the edge
+          counts();
+          footState.textContent = "● live"; footState.style.color = "var(--accent)";
+          change(snapshot);
+        } else if (msg.type === "state.reset") {
+          snapshot = msg.snapshot;
+          labels = snapshot.labels || {}; // refresh label-derived rendering
+          layout = buildLayout(snapshot);
+          transport.setLabels(labels);
+          transport.reset(snapshot.frames);
+          counts();
+          change(snapshot);
+        }
+      });
+      es.onerror = () => { footState.textContent = "replay"; footState.style.color = ""; };
+      return () => es && es.close();
+    }));
+
+  // Discrete UI controls stay redefine-in-place (they are toggles, not streams):
+  // theme, the DAG mode, the api-equivalent rate, and the surprise-ack counter.
   let theme = localStorage.getItem("reactor-devtools-theme") || "light";
+  const themeVar = main.variable(); themeVar.define("theme", [], () => theme);
   const setTheme = (t) => { theme = t; applyTheme(t); themeVar.define("theme", [], () => t); };
   const acked = new Set(); let ackN = 0;
-  const ackVar = main.variable();
-  ackVar.define("ack", [], () => ackN);
+  const ackVar = main.variable(); ackVar.define("ack", [], () => ackN);
   const toggleAck = (id) => { if (acked.has(id)) acked.delete(id); else acked.add(id); ackVar.define("ack", [], () => ++ackN); };
   let dagMode = localStorage.getItem("reactor-dag-mode") || "heat";
-  const dagModeVar = main.variable();
-  dagModeVar.define("dagMode", [], () => dagMode);
+  const dagModeVar = main.variable(); dagModeVar.define("dagMode", [], () => dagMode);
   const setDagMode = (m) => { dagMode = m; localStorage.setItem("reactor-dag-mode", m); dagModeVar.define("dagMode", [], () => m); const b = document.querySelector("#dag-toggle"); if (b) b.textContent = m === "heat" ? "heat-map" : "active path"; };
   let rate = Number(localStorage.getItem("reactor-rate")) || 5; // $/Mtok, API-equivalent
-  const rateVar = main.variable();
-  rateVar.define("rate", [], () => rate);
+  const rateVar = main.variable(); rateVar.define("rate", [], () => rate);
   const setRate = (v) => { rate = v; localStorage.setItem("reactor-rate", String(v)); rateVar.define("rate", [], () => v); };
 
+  // --- derived cells: everything reactively recomputes off snapshot + head -----
   main.variable().define("framesUpTo", ["snapshot", "head"], (s, h) => s.frames.slice(0, h + 1));
   main.variable(into("#cell-dag")).define("dag", ["snapshot", "head", "dagMode"], (s, h, m) => renderDag(s, layout, h, m));
   main.variable(into("#cell-cost")).define("costChart", ["framesUpTo", "theme", "snapshot"], (f, t, s) => costChart(f, t, s.frames.length));
   main.variable(into("#cell-dispo")).define("dispoCell", ["framesUpTo", "rate"], (f, r) => dispo(f, labels, r));
-  main.variable(into("#cell-tray")).define("trayCell", ["framesUpTo", "ack", "snapshot"], (f, a, s) => renderTray(f, labels, acked, setHead, toggleAck, s.chainVerify));
-  // Dataflow cell — lean into the Observable runtime: the live ledger + derived
-  // state as the iconic expandable Inspector tree (Gemini's highest-leverage call).
-  main.variable(new Inspector(document.querySelector("#cell-inspector"))).define("dataflow", ["framesUpTo", "snapshot"], (framesUpTo, snapshot) => ({
+  main.variable(into("#cell-tray")).define("trayCell", ["framesUpTo", "ack", "snapshot"], (f, a, s) => renderTray(f, labels, acked, goto, toggleAck, s.chainVerify));
+  // Dataflow — lean into the runtime: the live derived state as the iconic
+  // expandable Inspector tree, and the ledger as a sortable Inputs.table.
+  main.variable(new Inspector(document.querySelector("#cell-inspector"))).define("dataflow", ["framesUpTo", "snapshot"], (framesUpTo, s) => ({
     "ledger · frames ≤ head": framesUpTo,
-    costRollup: snapshot.costRollup,
-    nodes: snapshot.nodes.map((n) => n.id),
-    edges: snapshot.edges,
-    chainVerify: snapshot.chainVerify,
+    costRollup: s.costRollup,
+    nodes: s.nodes.map((n) => n.id),
+    edges: s.edges,
+    chainVerify: s.chainVerify,
   }));
+  main.variable(into("#cell-ledger-table")).define("ledgerTable", ["framesUpTo"], (f) => ledgerTable(f, labels));
 
   // settled-node toggle (#4a): heat-map (last disposition) vs active-path-only
   const graphHead = document.querySelector("#sec-graph h3");
@@ -357,67 +496,8 @@ async function boot() {
     costHead.append(el("span", { class: "rate-ctl" }, "$", inp, "/Mtok api-equiv"));
   }
 
-  // --- transport ---
-  const seek = document.querySelector("#seek");
-  seek.max = String(N - 1); seek.min = "-1"; seek.value = String(head);
-  const readout = document.querySelector("#readout");
-  const playBtn = document.querySelector("#t-play");
-  let timer = null;
-  const syncTransport = () => {
-    seek.value = String(head);
-    const f = head >= 0 ? snapshot.frames[head] : null;
-    const last = snapshot.frames.length - 1;
-    readout.innerHTML = f ? `frame <b>${head}</b>/${last} · ${shortName(f.node, labels)} · ${f.status}` : `frame —/${last}`;
-  };
-  const stop = () => { if (timer) { clearInterval(timer); timer = null; playBtn.textContent = "▶"; } };
-  const play = () => {
-    if (timer) return stop();
-    if (head >= snapshot.frames.length - 1) setHead(-1);
-    playBtn.textContent = "⏸";
-    timer = setInterval(() => { if (head >= snapshot.frames.length - 1) return stop(); setHead(head + 1); }, 320);
-  };
-  playBtn.onclick = play;
-  document.querySelector("#t-start").onclick = () => { stop(); setHead(-1); };
-  document.querySelector("#t-end").onclick = () => { stop(); setHead(snapshot.frames.length - 1); };
-  seek.oninput = () => { stop(); setHead(parseInt(seek.value, 10)); };
   themeBtn.onclick = () => setTheme(theme === "dark" ? "light" : "dark");
-  window.addEventListener("keydown", (e) => {
-    if (e.key === " ") { e.preventDefault(); play(); }
-    else if (e.key === "ArrowRight") { stop(); setHead(head + 1); }
-    else if (e.key === "ArrowLeft") { stop(); setHead(head - 1); }
-  });
-
-  // init
   setTheme(theme);
-  setHead(head);
-  window.__reactorSetHead = setHead;
-
-  // --- #4 live attach: stream appended receipts into the reactive graph ------
-  const footState = document.querySelector("#foot-state");
-  try {
-    const lastHash = snapshot.frames[snapshot.frames.length - 1]?.contentHash || "";
-    const es = new EventSource(`/events?after=${snapshot.frames.length - 1}&hash=${encodeURIComponent(lastHash)}`);
-    es.addEventListener("message", (e) => {
-      let msg; try { msg = JSON.parse(e.data); } catch { return; }
-      if (msg.type === "receipt.appended") {
-        const atEdge = head >= snapshot.frames.length - 1;
-        snapshot.frames.push(msg.frame);
-        seek.max = String(snapshot.frames.length - 1);
-        document.querySelector("#nb-counts").textContent = `${snapshot.frames.length} receipts · ${snapshot.nodes.length} nodes · ${snapshot.edges.length} edges`;
-        footState.textContent = "● live"; footState.style.color = "var(--accent)";
-        snapshotVar.define("snapshot", [], () => snapshot); // redefine → cells recompute
-        if (atEdge) setHead(snapshot.frames.length - 1); else syncTransport();
-      } else if (msg.type === "state.reset") {
-        snapshot = msg.snapshot;
-        labels = snapshot.labels || {}; // Codex #5: refresh label-derived rendering
-        layout = buildLayout(snapshot);
-        seek.max = String(snapshot.frames.length - 1);
-        snapshotVar.define("snapshot", [], () => snapshot);
-        setHead(snapshot.frames.length - 1);
-      }
-    });
-    es.onerror = () => { footState.textContent = "replay"; footState.style.color = ""; };
-  } catch { /* no EventSource — replay only */ }
 }
 
 boot().catch((err) => document.body.append(el("pre", { class: "cell-error" }, String(err && err.stack ? err.stack : err))));

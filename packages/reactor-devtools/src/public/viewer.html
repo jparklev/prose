@@ -200,6 +200,27 @@
       html[data-theme="dark"] .observablehq--number, html[data-theme="dark"] .observablehq--bigint, html[data-theme="dark"] .observablehq--date, html[data-theme="dark"] .observablehq--symbol { color: #2dd4bf; }
       html[data-theme="dark"] .observablehq--index, html[data-theme="dark"] .observablehq--key { color: #c084fc; }
       html[data-theme="dark"] .observablehq--string { color: #56b6c2; }
+
+      /* Inputs.table — the receipt ledger as a sortable Observable input. Styled
+         with semantic selectors (version-proof) over the zinc palette. */
+      .df-sub { font-size: 10.5px; text-transform: uppercase; letter-spacing: .09em; color: var(--dim); margin: 4px 0 6px; }
+      #cell-ledger-table { margin-bottom: 18px; }
+      /* Inputs.table's scroll viewport comes from ITS stylesheet (not bundled);
+         supply the max-height + internal scroll ourselves so it doesn't render all
+         rows full-height and overlap the inspector below. */
+      #cell-ledger-table form { margin: 0; max-width: 100%; max-height: 360px; overflow-y: auto; }
+      #cell-ledger-table table { width: 100%; border-collapse: collapse; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      #cell-ledger-table thead th { position: sticky; top: 0; z-index: 1; background: var(--panel); border-bottom: 1px solid var(--line); color: var(--dim); font-weight: 600; text-align: left; padding: 5px 9px; cursor: pointer; user-select: none; white-space: nowrap; }
+      #cell-ledger-table thead th:hover { color: var(--ink); }
+      #cell-ledger-table tbody td { padding: 3px 9px; border-bottom: 1px solid var(--line-soft); color: var(--ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+      #cell-ledger-table tbody tr:hover td { background: var(--hover); }
+      /* drop Inputs.table's row-select checkbox column (read-only ledger view) */
+      #cell-ledger-table thead th:first-child, #cell-ledger-table tbody td:first-child { display: none; }
+      #cell-ledger-table td.tbl-num, #cell-ledger-table th.tbl-num { text-align: right; }
+      .tbl-status { font-weight: 600; }
+      .tbl-status.s-rendered { color: var(--accent); }
+      .tbl-status.s-skipped { color: var(--skip); }
+      .tbl-status.s-failed { color: var(--fail); }
     </style>
   </head>
   <body>
@@ -230,7 +251,12 @@
           <section class="cell" id="sec-graph"><h3>Dependency graph</h3><div class="dag-wrap" id="cell-dag"></div></section>
           <section class="cell" id="sec-cost"><h3>Cost · fresh tokens per receipt</h3><div id="cell-cost"></div><div id="cell-dispo"></div></section>
           <section class="cell" id="sec-surprises"><h3>Surprise tray</h3><div id="cell-tray"></div></section>
-          <section class="cell" id="sec-dataflow"><h3>Dataflow · live ledger</h3><div id="cell-inspector"></div></section>
+          <section class="cell" id="sec-dataflow"><h3>Dataflow · live ledger</h3>
+            <div class="df-sub">receipt ledger — sortable</div>
+            <div id="cell-ledger-table"></div>
+            <div class="df-sub">dataflow tree</div>
+            <div id="cell-inspector"></div>
+          </section>
         </div>
       </main>
     </div>
